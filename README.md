@@ -26,4 +26,37 @@ tests/      # 테스트
 ## 설정
 ```bash
 cp .env.example .env   # 인증키 입력
+py -m venv .venv
+.venv/Scripts/python -m pip install -r requirements.txt
+```
+
+> open.law.go.kr에서 OPEN API 활용 신청 시 **호출하는 서버의 IP/도메인을 등록**해야 합니다.
+> 미등록 시 `사용자 정보 검증에 실패하였습니다` 또는 `필수입력요소 검증에 실패하였습니다` 오류가 납니다.
+
+## 실행
+```bash
+.venv/Scripts/python -m src.fetch_sample                  # 서울특별시 조례 상위 3건
+.venv/Scripts/python -m src.fetch_sample --org-name 수원시 --limit 5
+.venv/Scripts/python -m src.fetch_sample --org-name "서울특별시 중구" --query 주차장
+.venv/Scripts/python -m src.fetch_sample --org 6410000 --sborg 3740000   # 기관코드 직접 지정
+.venv/Scripts/python -m pytest -q                         # 파서 테스트
+```
+결과: `data/raw/sample_ordinance.json` (파싱 결과), `data/raw/*.xml` (원본 응답)
+
+## 수원시 MVP 파이프라인
+설계: [docs/db_design.md](docs/db_design.md), 스키마: [db/schema.sql](db/schema.sql)
+
+```bash
+# 0. 클라우드 PostgreSQL에 스키마 적용 (최초 1회)
+psql "$DATABASE_URL" -f db/schema.sql
+
+# 1. 원본 XML 수집 → data/raw/3740000/{mst}.xml  (중단 후 재실행하면 이어받음)
+.venv/Scripts/python -m src.collect_suwon
+
+# 2. 청킹 결과·예상 비용 확인 (DB·API 불필요)
+.venv/Scripts/python -m src.load_to_db --dry-run
+
+# 3. DB 적재 + Upstage 임베딩  (중단 후 재실행하면 이어서 처리)
+.venv/Scripts/python -m src.load_to_db
+.venv/Scripts/python -m src.load_to_db --embed-only   # 임베딩만 재시도
 ```
