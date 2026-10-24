@@ -39,7 +39,8 @@ py -m venv .venv
 .venv/Scripts/python -m src.fetch_sample --org-name 수원시 --limit 5
 .venv/Scripts/python -m src.fetch_sample --org-name "서울특별시 중구" --query 주차장
 .venv/Scripts/python -m src.fetch_sample --org 6410000 --sborg 3740000   # 기관코드 직접 지정
-.venv/Scripts/python -m pytest -q                         # 파서 테스트
+.venv/Scripts/python -m pytest -q                         # 단위 테스트 (DB·API 불필요)
+ELIS_LIVE_TESTS=1 .venv/Scripts/python -m pytest tests/test_rag_scenarios.py -v -s   # 자료요구 시나리오 통합 테스트 (DB·LLM 호출)
 ```
 결과: `data/raw/sample_ordinance.json` (파싱 결과), `data/raw/*.xml` (원본 응답)
 

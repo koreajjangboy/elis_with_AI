@@ -285,12 +285,21 @@ def quote_in_source(quote: str, source: Source) -> bool:
     pieces = [p for p in (_match_text(q) for q in split_quote(quote)) if p]
     if not pieces:
         return False
+    # LLM이 뒤쪽 항('③ …') 앞에 조 제목을 붙여 인용하는 경우: 제목은 원문 맨 앞에 있으므로 별도 조각으로 떼어 대조한다
+    heading = _match_text(f"{source.ref}({source.title})") if source.kind == "article" and source.title else ""
+    if heading and pieces[0].startswith(heading) and pieces[0] != heading:
+        pieces[0:1] = [heading, pieces[0][len(heading):]]
     pos = 0
     for piece in pieces:
         if len(piece) < 2 or (found := haystack.find(piece, pos)) < 0:
             return False
         pos = found + len(piece)
     return True
+
+
+def mentions_ref(text: str, ref: str) -> bool:
+    """'제5조'가 '제15조'·'제5조의2' 안에 들어 있는 경우는 표기로 보지 않는다 (항·호 표기 '제5조제1항'은 인정)."""
+    return re.search(rf"(?<!\d){re.escape(ref)}(?!\d|의\s*\d)", text) is not None
 
 
 def unverifiable(sources: list[Source], model: str, notes: list[str] | None = None) -> Answer:
@@ -342,9 +351,17 @@ def validate_answer(raw: dict, sources: list[Source], model: str, notes: list[st
 
     answer = str(raw.get("answer", "")).strip()
     cited = list(dict.fromkeys(c.source_id for c in citations))
-    missing = [by_id[sid].label for sid in cited if by_id[sid].ref not in answer]
-    if missing or not answer:
-        answer = (answer + "\n\n" if answer else "") + "근거: " + ", ".join(missing or [by_id[s].label for s in cited])
+    # 본문 중간의 조문 언급이 아니라 마지막 '근거:' 줄에 인용 자료가 모두 표기됐는지 본다
+    lines = answer.splitlines()
+    basis_idx = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip().startswith("근거:")), None)
+    basis = lines[basis_idx] if basis_idx is not None else ""
+    missing = [by_id[sid].label for sid in cited if not mentions_ref(basis, by_id[sid].ref)]
+    if missing:
+        if basis_idx is not None:
+            lines[basis_idx] = basis.rstrip().rstrip(",") + ", " + ", ".join(missing)
+            answer = "\n".join(lines)
+        else:
+            answer = (answer + "\n\n" if answer else "") + "근거: " + ", ".join(missing)
         notes.append("답변에 빠진 근거 표기를 자동으로 덧붙였습니다.")
         dprint(f"  → 답변에 없던 근거 표기 자동 추가: {missing or cited}")
     dprint(f"  → 최종: answered · 근거 자료 {cited}")
