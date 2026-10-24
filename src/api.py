@@ -110,6 +110,8 @@ class AskResponse(BaseModel):
     sources: list[SourceOut] = Field(description="LLM에 제공한 근거 자료 전체 (화면의 원문 펼쳐보기용)")
     model: str
     notes: list[str]
+    unconfirmed: list[str] = Field(default_factory=list,
+                                   description="질문 중 근거 자료로 확인되지 않은 사항 (비어 있지 않으면 부분 답변)")
 
 
 # ---------------------------------------------------------------- 엔드포인트

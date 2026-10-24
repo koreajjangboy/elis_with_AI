@@ -95,6 +95,8 @@ def render_answer(result: dict) -> None:
                    "아래 검색 결과를 직접 확인하거나 질문을 구체적으로 바꿔 보세요.")
     else:
         st.markdown(result["answer"])
+        if result.get("unconfirmed"):
+            st.info("**조례로 확인되지 않은 사항** (부분 답변)\n\n" + "\n".join(f"- {u}" for u in result["unconfirmed"]))
 
     for note in result.get("notes", []):
         st.caption(f"ℹ️ {note}")

@@ -289,3 +289,101 @@ def test_quote_with_own_ordinance_name_prefix_passes():
     assert not quote_in_source("수원시 각종 위원회 설치 및 운영 조례", src)  # 조례명뿐인 인용은 근거가 아니다
     assert not quote_in_source("수원시 인권 기본 조례 제15조(회의록의 작성 및 공개)", src)  # 다른 조례명은 떼지 않는다
     assert not quote_in_source("수원시 각종 위원회 설치 및 운영 조례 ③ 회의록은 의원이 요구하면 공개하여야 한다.", src)
+
+
+# ---- 2단계 근거 검증 (질문 대상·서술 부합)
+SUBCOMMITTEE = Source(id="S1", kind="article", label="수원시 도시계획 조례 제80조", ref="제80조", ordinance_name="수원시 도시계획 조례",
+                      title="분과위원회", content="제80조(분과위원회) ④ 분과위원회의 회의는 재적위원 과반수의 출석으로 개의하고 출석위원 과반수의 찬성으로 의결한다.")
+RECUSAL_Q = "도시계획위원회의 심의 사항과 위원 제척·회피에 관한 조문은 어디에 있나요?"
+
+
+
+
+
+def test_prompt_allows_partial_answers_and_limits_unverifiable():
+    from src.rag import SYSTEM_PROMPT
+
+    prompt = build_user_prompt("청년 창업 지원금 1인당 한도는?", _sources())
+    assert "조례에 구체적 기준은 규정되어 있지 않음" in prompt and "관련된 조항이 전혀 없을 때만" in prompt
+    assert "조례에 구체적 기준은 규정되어 있지 않음" in SYSTEM_PROMPT and "근거 자료에서 확인되지 않음" in SYSTEM_PROMPT
+
+
+
+def test_prompt_treats_data_requests_as_operating_rules():
+    from src.rag import SYSTEM_PROMPT
+
+    assert "자료요구" in SYSTEM_PROMPT and "위탁 관리, 요금 징수, 운영 기준" in SYSTEM_PROMPT
+    assert "조례로는 확인할 수 없음" in SYSTEM_PROMPT  # 실적·수입 같은 사실 정보는 여전히 조례로 확인 불가
+
+
+class _FakeLLM:
+    name = "fake"
+
+    def __init__(self, reply=None, error=None):
+        self.reply, self.error, self.calls = reply, error, []
+
+    def complete_json(self, system, user, schema):
+        self.calls.append((system, user))
+        if self.error:
+            raise self.error
+        return self.reply
+
+
+def _recusal_answer():
+    from src.rag import Answer, Citation
+
+    cit = Citation("S1", SUBCOMMITTEE.label, "출석위원 과반수의 찬성으로 의결한다")
+    return Answer("answered", "위원의 제척·회피는 제80조제4항에 규정되어 있습니다.\n근거: 수원시 도시계획 조례 제80조",
+                  [cit], [SUBCOMMITTEE], "test")
+
+
+def test_verify_prompt_carries_question_answer_and_cited_text():
+    from src.rag import build_verify_prompt
+
+    prompt = build_verify_prompt(RECUSAL_Q, _recusal_answer())
+    assert prompt.startswith(f"[사용자 질문]\n{RECUSAL_Q}")
+    assert "[S1] 수원시 도시계획 조례 제80조(분과위원회)" in prompt and "재적위원 과반수" in prompt
+    assert "“출석위원 과반수의 찬성으로 의결한다”" in prompt
+    assert "근거:" not in prompt  # 답변 본문만 보낸다
+
+
+def test_verify_answer_returns_flagged_citations_and_tolerates_failure():
+    from src.rag import VERIFY_SYSTEM_PROMPT, verify_answer
+
+    llm = _FakeLLM({"subject": "도시계획위원회 위원 제척", "checks": [
+        {"source_id": "S1", "about_subject": True, "supports_answer": False, "reason": "의결 정족수 조항이다"},
+        {"source_id": "S9", "about_subject": False, "supports_answer": False, "reason": "인용되지 않은 자료"}]})
+    bad = verify_answer(llm, RECUSAL_Q, _recusal_answer())
+    assert list(bad) == ["S1"] and "답변 서술이 원문과 다름" in bad["S1"] and "정족수" in bad["S1"]
+    assert llm.calls[0][0] == VERIFY_SYSTEM_PROMPT
+    assert verify_answer(_FakeLLM(error=RuntimeError("timeout")), RECUSAL_Q, _recusal_answer()) == {}
+    ok = _FakeLLM({"subject": "x", "checks": [{"source_id": "S1", "about_subject": True, "supports_answer": True, "reason": ""}]})
+    assert verify_answer(ok, RECUSAL_Q, _recusal_answer()) == {}
+
+
+def test_apply_verification_drops_flagged_or_turns_unverifiable():
+    from src.rag import VERIFY_NOTE, apply_verification
+
+    only = apply_verification(_recusal_answer(), {"S1": "답변 서술이 원문과 다름"})
+    assert only.status == "unverifiable" and only.citations == [] and any(VERIFY_NOTE in n for n in only.notes)
+
+    src = _sources()
+    from src.rag import Answer, Citation
+    mixed = Answer("answered", "…", [Citation("S1", src[0].label, "장애인 자동차: 100분의 50"),
+                                      Citation("S2", src[1].label, "경형자동차 | 50퍼센트")], src, "test")
+    kept = apply_verification(mixed, {"S2": "질문 대상과 다른 조문"})
+    assert kept.status == "answered" and [c.source_id for c in kept.citations] == ["S1"]
+    assert any(VERIFY_NOTE in n for n in kept.notes)
+
+
+def test_unconfirmed_items_mark_partial_answers():
+    raw = {"status": "answered", "answer": "보험금 지급 절차는 제5조와 같습니다.\n근거: 수원시 주차장 조례 제5조",
+           "citations": [{"source_id": "S1", "quote": "장애인 자동차: 100분의 50"}], "unconfirmed": ["작년 지급 건수", " "]}
+    result = validate_answer(raw, _sources(), "test")
+    assert result.unconfirmed == ["작년 지급 건수"] and result.partial
+    full = validate_answer({**raw, "unconfirmed": []}, _sources(), "test")
+    assert full.unconfirmed == [] and not full.partial
+    disclosed = validate_answer({**raw, "answer": "지급 건수는 조례로는 확인할 수 없습니다. 지급 절차는 제5조와 같습니다.",
+                                 "unconfirmed": []}, _sources(), "test")
+    assert disclosed.partial  # unconfirmed가 비어도 본문에서 스스로 밝혔으면 부분 답변
+
