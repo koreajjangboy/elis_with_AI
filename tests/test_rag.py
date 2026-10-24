@@ -100,6 +100,14 @@ def test_user_prompt_marks_ocr_related_and_unextracted():
     assert prompt.endswith("질문: 감면 기준은?")
 
 
+def test_user_prompt_puts_question_first_and_separates_sections():
+    prompt = build_user_prompt("  감면 기준은?\n", _sources())
+    assert prompt.startswith("[사용자 질문]\n감면 기준은?\n\n[근거 자료] 아래 3건(S1, S2, S3)만 근거로 쓸 수 있다.")
+    q, s, r = (prompt.index(h) for h in ("[사용자 질문]", "[근거 자료]", "[답변 요청]"))
+    assert q < s < prompt.index("[S1] 수원시 주차장 조례 제5조") < r
+    assert prompt.count("감면 기준은?") == 2  # 맨 앞 + 답변 요청
+
+
 def test_quote_tolerates_llm_ellipsis_and_wrapping_quotes():
     src = _sources()[0]
     assert quote_in_source("시장은 다음 각 호의 자동차에 대하여…", src)
@@ -218,3 +226,66 @@ def test_basis_line_ref_must_not_match_longer_article_number():
                          {"source_id": "S2", "quote": "경형자동차 | 50퍼센트"}]}
     last = validate_answer(raw, _sources(), "test").answer.splitlines()[-1]
     assert last == "근거: 수원시 주차장 조례 제15조, 수원시 주차장 조례 제5조, 수원시 주차장 조례 [별표 2] 감면 기준(제5조 관련)"
+
+
+# ---- 질문 대상 조례 점검 (타 조례 혼입 방지)
+YOUTH_W = {"청년": 5.4, "창업": 6.5, "지원": 2.2, "사업": 4.5}  # '청년 창업 지원 사업 … 환수 사유' 질문의 조례명 핵심어
+
+
+def _topic_sources() -> list[Source]:
+    mk = lambda sid, name, ref, text: Source(id=sid, kind="article", label=f"{name} {ref}", ref=ref, ordinance_name=name,
+                                             title="", content=text)
+    return [mk("S1", "수원시 청년 창업 지원 조례", "제5조", "제5조(사업지원) 시장은 청년 창업 지원을 위하여 사업을 지원할 수 있다."),
+            mk("S2", "수원시 양성평등 기본 조례", "제50조", "제50조(환수) 거짓이나 부정한 방법으로 지원받은 경우 환수한다.")]
+
+
+def test_off_topic_only_when_question_points_to_an_ordinance():
+    from src.rag import off_topic_ordinances
+
+    retrieved = ["수원시 청년 창업 지원 조례", "수원시 양성평등 기본 조례"]
+    assert off_topic_ordinances(YOUTH_W, ["수원시 양성평등 기본 조례"], retrieved) == ["수원시 양성평등 기본 조례"]
+    assert off_topic_ordinances(YOUTH_W, ["수원시 청년 창업 지원 조례"], retrieved) == []
+    # 질문이 특정 조례를 가리키지 않으면(일치도 0.5 이상인 조례 없음) 판단하지 않는다: 정답 조례도 일치도 0일 수 있음
+    fund_w = {"기후": 6.9, "대응": 6.5, "기금": 5.4}
+    assert off_topic_ordinances(fund_w, ["수원시 탄소중립 기본 조례"], ["수원시 탄소중립 기본 조례", "수원시 재난관리기금 운용ㆍ관리 조례"]) == []
+
+
+def test_topic_guard_unverifiable_when_only_off_topic_cited():
+    from src.rag import TOPIC_NOTE, Answer, Citation, apply_topic_guard
+
+    src = _topic_sources()
+    wrong = Answer("answered", "허위로 지원받으면 환수합니다.\n근거: 수원시 양성평등 기본 조례 제50조",
+                   [Citation("S2", src[1].label, "거짓이나 부정한 방법으로 지원받은 경우 환수한다")], src, "test")
+    result = apply_topic_guard(wrong, YOUTH_W)
+    assert result.status == "unverifiable" and result.answer == UNVERIFIABLE and result.citations == []
+    assert any(TOPIC_NOTE in n and "양성평등" in n for n in result.notes)
+
+
+def test_topic_guard_warns_on_partial_mixing_and_ignores_on_topic():
+    from src.rag import TOPIC_NOTE, Answer, Citation, apply_topic_guard
+
+    src = _topic_sources()
+    on = Citation("S1", src[0].label, "청년 창업 지원을 위하여 사업을 지원할 수 있다")
+    off = Citation("S2", src[1].label, "부정한 방법으로 지원받은 경우 환수한다")
+    mixed = apply_topic_guard(Answer("answered", "…", [on, off], src, "test"), YOUTH_W)
+    assert mixed.status == "answered" and len(mixed.citations) == 2
+    assert any(TOPIC_NOTE in n for n in mixed.notes)
+    clean = apply_topic_guard(Answer("answered", "…", [on], src, "test"), YOUTH_W)
+    assert clean.status == "answered" and clean.notes == []
+
+
+def test_repair_feedback_lists_off_topic_ordinances():
+    from src.rag import repair_feedback
+
+    text = repair_feedback({"answer": "이전"}, [], ["수원시 양성평등 기본 조례"])
+    assert "질문이 묻는 조례·사업이 아닙니다" in text and "- 수원시 양성평등 기본 조례" in text
+    assert "글자 그대로 존재하지 않습니다" not in text
+
+
+def test_quote_with_own_ordinance_name_prefix_passes():
+    src = _committee_source()
+    assert quote_in_source("수원시 각종 위원회 설치 및 운영 조례 제15조(회의록의 작성 및 공개)", src)
+    assert quote_in_source("수원시 각종 위원회 설치 및 운영 조례 제15조(회의록의 작성 및 공개) ③ 제1항에 따라 작성된 회의록은", src)
+    assert not quote_in_source("수원시 각종 위원회 설치 및 운영 조례", src)  # 조례명뿐인 인용은 근거가 아니다
+    assert not quote_in_source("수원시 인권 기본 조례 제15조(회의록의 작성 및 공개)", src)  # 다른 조례명은 떼지 않는다
+    assert not quote_in_source("수원시 각종 위원회 설치 및 운영 조례 ③ 회의록은 의원이 요구하면 공개하여야 한다.", src)

@@ -18,6 +18,7 @@ venv/
 data/raw/
 data/processed/
 data/index/
+data/eval/
 *.sqlite
 *.db
 chroma/
