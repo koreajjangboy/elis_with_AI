@@ -18,6 +18,12 @@ def test_strip_revision_notes():
     assert notes == ["<개정 2024. 12. 30.>", "<단서 신설 2026.09.30.>", "[본조신설 2020. 1. 1.]"]
 
 
+def test_strip_moved_notes_and_html_but_keep_annex_refs():
+    text, notes = strip_revision_notes('<p style="font-family:굴림체">③ [별표 1]에 따른다.<종전 제2항에서 이동 2020.1.1.><2016.08.19. 호 신설></p>')
+    assert text == "③ [별표 1]에 따른다."
+    assert notes == ["<종전 제2항에서 이동 2020.1.1.>", "<2016.08.19. 호 신설>"]
+
+
 def test_short_article_single_chunk_with_header():
     (article, addendum) = build_articles(_ordinance("제1조(목적) 이 조례는 「주차장법」에 따른 사항을 규정한다.<개정 2024. 1. 5.>"))
     assert [c.granularity for c in article.chunks] == ["article"]
@@ -39,6 +45,12 @@ def test_long_article_adds_paragraph_chunks():
     assert "1. 장애인\n가. 본인" in p1.content  # 호·목은 항 청크에 포함
 
 
+def test_deleted_paragraph_skipped_in_paragraph_chunks():
+    filler = "가" * ARTICLE_SPLIT_CHARS
+    (article, _) = build_articles(_ordinance(f"제5조(감면) ① {filler}\n② <삭제 2020. 1. 1.>\n③ 다른 내용"))
+    assert [c.paragraph_no for c in article.chunks if c.granularity == "paragraph"] == [1, 3]
+
+
 def test_deleted_article_has_no_chunk():
     (article, _) = build_articles(_ordinance("제3조 삭제 <2020. 1. 1.>"))
     assert article.article_no == "3" and article.chunks == []
@@ -48,3 +60,9 @@ def test_is_local_ordinance():
     assert is_local_ordinance("수원시 사무위탁 조례", "경기도 수원시")
     assert is_local_ordinance("경기도 주차장 조례", "경기도 수원시")
     assert not is_local_ordinance("주차장법 시행규칙", "경기도 수원시")
+
+
+def test_deleted_paragraph_range_skipped():
+    filler = "가" * ARTICLE_SPLIT_CHARS
+    (article, _) = build_articles(_ordinance(f"제23조(휴가) ① {filler}\n⑥ ~ ⑨ <삭제 2025.07.10.>\n⑩ 다른 내용"))
+    assert [c.paragraph_no for c in article.chunks if c.granularity == "paragraph"] == [1, 10]

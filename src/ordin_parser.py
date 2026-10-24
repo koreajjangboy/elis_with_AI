@@ -114,6 +114,12 @@ def parse_article_text(text: str) -> dict:
     return {"article_no": article_no, "title": title, "paragraphs": paragraphs}
 
 
+def article_label(article_no: str) -> str:
+    """parse_article_text의 조 번호를 법령 인용 표기로: '3' → '제3조', '3의2' → '제3조의2'."""
+    main, _, branch = article_no.partition("의")
+    return f"제{main}조" + (f"의{branch}" if branch else "")
+
+
 def extract_law_references(text: str) -> list[str]:
     """본문에서 「」로 인용된 법령명을 등장 순서대로 중복 없이 추출."""
     return list(dict.fromkeys(_LAW_REF_RE.findall(text)))
@@ -129,6 +135,57 @@ def _collect_article_text(el: ET.Element) -> str:
         for item in para.iter("호"):
             parts.append(_text(item.find("호내용")) or _text(item))
     return "\n".join(p for p in parts if p)
+
+
+# ---------------------------------------------------------------- 별표·서식
+
+_RELATED_ARTICLE_RE = re.compile(r"(제\d+조(?:의\d+)?)[^()]*관련")
+_BRACKET_LABEL_RE = re.compile(r"^\s*[\[〔【［]\s*(?:별표|별지)[^\]〕】］]*[\]〕】］]")  # '[별표 1-1]', '〔별지 제3호서식〕'
+_PLAIN_LABEL_RE = re.compile(r"^\s*(?:별표|별지)\s*[\d\-]*")  # 괄호 없는 '별표2', '별표'
+# 삭제 표기에 붙는 부속어: '<삭제 2017.04.03 조례 제3655호>', '<2013.7.31 개정으로 삭제>', '(삭제 2011.04.01)'
+_DELETION_FILLER_RE = re.compile(r"삭제|개정으로|조례|제\d+호|[\d\s.,\-<>〈〉()（）\[\]]")
+
+
+def is_deleted_annex(title: str) -> bool:
+    """라벨을 떼고 삭제 표기의 부속어(날짜·괄호·'개정으로' 등)를 지웠을 때 아무것도 남지 않으면 삭제된 별표.
+    '[별표 2] 삭제할 사항의 처리기준'처럼 실제 제목이 남으면 삭제가 아니다."""
+    rest = _BRACKET_LABEL_RE.sub("", title, count=1)
+    if rest == title:
+        rest = _PLAIN_LABEL_RE.sub("", title, count=1)
+    return "삭제" in rest and not _DELETION_FILLER_RE.sub("", rest)
+
+
+def annex_kind(title: str) -> str:
+    """API의 별표구분은 별표도 '서식'으로 주는 경우가 많아 제목 접두어로 판별한다.
+    '[별표 1] …', '〔별표〕 …' → 별표 / '[별지 제1호서식] …' → 서식 / 삭제 표기만 있으면 → 삭제"""
+    head = title.lstrip("[〔【［(（<〈 ").replace(" ", "")
+    if is_deleted_annex(title):
+        return "삭제"
+    if head.startswith("별표"):
+        return "별표"
+    if head.startswith("별지") or "서식" in head[:12]:
+        return "서식"
+    return "기타"
+
+
+def parse_annexes(root: ET.Element) -> list[dict]:
+    """<별표단위> 목록. 본문(별표내용)은 대개 비어 있고 첨부파일 URL로만 제공된다."""
+    annexes = []
+    for el in root.iter("별표단위"):
+        title = _text(el.find("별표제목"))
+        related = _RELATED_ARTICLE_RE.search(title)
+        annexes.append({
+            "key": el.get("별표키", "") or _text(el.find("별표키")),
+            "no": str(int(_text(el.find("별표번호")) or 0)),
+            "branch_no": str(int(_text(el.find("별표가지번호")) or 0)),
+            "kind": annex_kind(title),
+            "title": title,
+            "related_article": related.group(1) if related else "",
+            "file_type": _text(el.find("별표첨부파일구분")).lower(),
+            "url": _text(el.find("별표첨부파일명")),
+            "content": _text(el.find("별표내용")),
+        })
+    return annexes
 
 
 # 본문 API는 자치법규종류를 코드로 반환한다 (목록 API는 이름으로 반환)
@@ -191,5 +248,6 @@ def parse_ordinance_detail(root: ET.Element, org_code: str = "") -> dict:
         "chapters": structure,
         "articles": articles,
         "addenda": addenda,
+        "annexes": parse_annexes(root),
         "referenced_laws": extract_law_references(full_text),
     }

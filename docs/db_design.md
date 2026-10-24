@@ -115,7 +115,39 @@ src/
 - **호스팅**: pgvector를 지원하는 관리형 Postgres(Supabase, Neon, AWS RDS 등). 로컬 개발은 `pgvector/pgvector:pg17` Docker 이미지.
 - **응답 구성**: 검색은 chunk 단위, 표시는 `articles.structure`로 조 전체를 렌더링하고 `citation`으로 근거를 표기한다.
 
-## 7. 결정이 필요한 사항
+## 7. 별표·서식 (첨부 문서)
+
+> 상세 설계(이미지형 별표 처리, 자리표시 청크, RAG 연계)는 [attachment_design.md](attachment_design.md)에 정리했다. 아래는 요약.
+
+**확인된 사실 (수원시 707건 기준, 2026-10-22)**
+- 218개 조례에 별표·서식 788건 (별표 323, 서식 459, 삭제 6).
+- API의 `별표내용`은 **전부 비어 있고** 첨부파일 URL만 온다: hwp 757 · hwpx 16 · txt 15. 인증키 없이 다운로드된다.
+- API의 `별표구분`은 별표도 '서식'으로 주므로 제목 접두어(`[별표 …]`, `[별지 …]`)로 종류를 판별한다.
+
+**구조**
+```
+ordinances 1 ─ N attachments (문서 메타·추출 텍스트·추출 상태)  1 ─ N chunks (attachment_id, 검색 단위 + 임베딩)
+```
+- 임베딩은 attachments가 아니라 **chunks에 둔다.** 조문과 별표를 같은 테이블·인덱스로 한 번에 하이브리드 검색하기 위해서다.
+  긴 별표(예: 통·반 관할구역표 수십만 자)는 한 벡터로 표현할 수 없어 어차피 여러 조각으로 나눠야 한다.
+- chunks는 `article_id`와 `attachment_id` 중 정확히 하나를 가진다 (`chunks_owner_check`).
+
+**추출 파이프라인** (`collect_attachments` → `load_attachments` → `load_to_db --embed-only`)
+
+| 형식 | 로컬 추출기 | 비고 |
+|---|---|---|
+| hwp (HWP 5.x, OLE) | `olefile` + BodyText 레코드 파싱 | 표는 셀 단위 줄로 나옴(행 구조 손실). 배포용·암호화 문서는 needs_ocr/unsupported |
+| hwpx (OWPML zip) | section XML 파싱 | 표를 행마다 `셀 \| 셀`로 복원 |
+| txt | cp949/utf-8 디코딩 | 괘선 표 그대로 |
+
+**이미지형 별표 대응**
+- 로컬 추출 텍스트가 30자 미만이고 그림이 있으면 `needs_ocr`. 그림이 섞인 문서는 `has_images=true`로 표시해 화면에서 원문 링크를 함께 보여 준다.
+- `FallbackExtractor` 프로토콜로 OCR·멀티모달 추출기를 교체할 수 있다. 기본 구현은 **Upstage Document Parse**:
+  HWP를 직접 받으며 그림 속 글자도 OCR한다. 단 `chart_recognition`은 끈다 — 켜면 도면을 차트로 오인해
+  **원문에 없는 수치표를 만들어 냈다.**
+- 정책(`--ocr`): `none`(로컬만) / `needs`(이미지형·실패 문서만, 기본) / `images`(그림 포함 문서 전부, 페이지당 과금).
+
+## 8. 결정이 필요한 사항
 
 1. **임베딩 모델** (스키마의 벡터 차원이 이것에 따라 정해짐)
    - bge-m3 (1024차원, 무료·로컬, 한국어 양호)

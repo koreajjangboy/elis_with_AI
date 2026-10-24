@@ -13,17 +13,25 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from src.ordin_parser import PARAGRAPH_MARKS, extract_law_references, parse_article_text
+from src.ordin_parser import PARAGRAPH_MARKS, article_label, extract_law_references, parse_article_text
 
 ARTICLE_SPLIT_CHARS = 800
 MAX_EMBED_CHARS = 6000  # Solar Embedding 2 입력 한도(8k 토큰) 대비 여유
 
+_REVISION_KEYWORDS = "개정|신설|삭제|시행|종전|이동"
 # '<개정 2024. 12. 30.>', '<단서 신설 2026.09.30.>', '<2020. 1. 1.>'(삭제 조문), '[본조신설 2020. 1. 1.]' 등
 _REVISION_RE = re.compile(
-    r"<[^<>]*(?:개정|신설|삭제|시행)[^<>]*\d{4}[^<>]*>"
+    rf"<(?=[^<>]*(?:{_REVISION_KEYWORDS}))(?=[^<>]*\d{{4}})[^<>]*>"  # 키워드·연도 순서 무관
     r"|<\s*\d{4}\s*\.\s*\d{1,2}\s*\.\s*\d{1,2}\s*\.?\s*(?:,[^<>]*)?>"
-    r"|\[[^\[\]]*(?:개정|신설|삭제|시행|종전|이동)[^\[\]]*\d{4}[^\[\]]*\]"
+    rf"|\[[^\[\]]*(?:{_REVISION_KEYWORDS})[^\[\]]*\d{{4}}[^\[\]]*\]"
 )
+# 인용 대조용 (src/rag.py): 위 패턴 + 괄호형 '(개정 2009.01.08)', '(종전 제5항에서 이동 2019.12.31)', '(본조개정 2016.09.28)'.
+# 키워드와 4자리 연도가 모두 있는 괄호만 해당하므로 '(제5조 관련)', '(이하 "시장"이라 한다)'는 건드리지 않는다.
+# 괄호형은 청킹(strip_revision_notes)에는 적용하지 않는다: 적용하면 저장된 청크·임베딩과 달라져 전체 재적재가 필요하다.
+REVISION_NOTE_RE = re.compile(
+    rf"{_REVISION_RE.pattern}|\((?=[^()]*(?:{_REVISION_KEYWORDS}))(?=[^()]*\d{{4}})[^()]*\)"
+)
+_HTML_TAG_RE = re.compile(r"</?[a-zA-Z][^<>]*>")  # 일부 조문에 섞인 '<p style=...>' 등
 _SPACES_RE = re.compile(r"[ \t]+")
 
 
@@ -52,7 +60,7 @@ class ArticleRecord:
 
 def strip_revision_notes(text: str) -> tuple[str, list[str]]:
     notes = [m.group(0) for m in _REVISION_RE.finditer(text)]
-    cleaned = _REVISION_RE.sub("", text)
+    cleaned = _HTML_TAG_RE.sub("", _REVISION_RE.sub("", text))
     cleaned = "\n".join(_SPACES_RE.sub(" ", line).strip() for line in cleaned.splitlines())
     return cleaned.strip(), notes
 
@@ -95,12 +103,13 @@ def build_articles(ordinance: dict) -> list[ArticleRecord]:
         if _is_deleted(structure):
             continue
 
-        head = f"제{no}조" + (f"({title})" if title else "")
+        label = article_label(no)
+        head = label + (f"({title})" if title else "")
         record.chunks.append(
             ChunkRecord(
                 granularity="article",
                 paragraph_no=None,
-                citation=f"{name} 제{no}조",
+                citation=f"{name} {label}",
                 content=cleaned,
                 embed_text=f"[{name}]\n{cleaned}"[:MAX_EMBED_CHARS],
             )
@@ -109,12 +118,15 @@ def build_articles(ordinance: dict) -> list[ArticleRecord]:
         numbered = [p for p in structure["paragraphs"] if p["number"]]
         if len(cleaned) > ARTICLE_SPLIT_CHARS and len(numbered) >= 2:
             for p in numbered:
+                # 삭제된 항('② <삭제 …>', '⑥ ~ ⑨ <삭제 …>') → 개정 표기를 떼면 빈 항
+                if not p["text"].strip(" 삭제.~∼-") and not p["items"]:
+                    continue
                 content = render_paragraph(p)
                 record.chunks.append(
                     ChunkRecord(
                         granularity="paragraph",
                         paragraph_no=p["number"],
-                        citation=f"{name} 제{no}조제{p['number']}항",
+                        citation=f"{name} {label}제{p['number']}항",
                         content=content,
                         embed_text=f"[{name}] {head}\n{content}"[:MAX_EMBED_CHARS],
                     )
@@ -136,6 +148,60 @@ def build_articles(ordinance: dict) -> list[ArticleRecord]:
             )
         )
     return records
+
+
+# ---------------------------------------------------------------- 별표·서식
+
+ATTACHMENT_CHUNK_CHARS = 1500
+
+
+@dataclass
+class AttachmentChunk:
+    chunk_seq: int
+    citation: str
+    content: str
+    embed_text: str
+
+
+def split_lines(text: str, max_chars: int = ATTACHMENT_CHUNK_CHARS) -> list[str]:
+    """줄 경계에서 max_chars 이하로 나눈다. 한 줄이 너무 길면 그 줄만 글자 수로 자른다."""
+    pieces, current = [], ""
+    for line in text.splitlines():
+        while len(line) > max_chars:
+            if current:
+                pieces.append(current)
+                current = ""
+            pieces.append(line[:max_chars])
+            line = line[max_chars:]
+        if current and len(current) + 1 + len(line) > max_chars:
+            pieces.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current.strip():
+        pieces.append(current)
+    return [p.strip() for p in pieces if p.strip()]
+
+
+# 본문을 추출하지 못한 별표(이미지형·배포용 문서 등)도 제목으로는 검색되게 하는 자리표시 청크.
+# 답변 생성 시 이 문구만으로는 근거가 될 수 없으므로 LLM은 '확인 불가'와 원문 링크로 안내하게 된다.
+UNEXTRACTED_NOTE = "(본문 텍스트 미추출: 이미지형 문서 등으로 내용을 읽지 못했습니다. 원문 파일을 확인하세요.)"
+
+
+def build_attachment_chunks(ordinance_name: str, title: str, text: str | None) -> list[AttachmentChunk]:
+    """별표 텍스트를 검색 청크로. 조각마다 조례명·별표 제목 헤더를 붙여 단독으로도 맥락이 통하게 한다.
+    텍스트가 없으면(OCR 대기 등) 제목만 담은 자리표시 청크 1개를 만들어 별표가 검색에서 누락되지 않게 한다."""
+    title = " ".join(title.split())
+    pieces = split_lines(text or "") or [UNEXTRACTED_NOTE]
+    return [
+        AttachmentChunk(
+            chunk_seq=i,
+            citation=f"{ordinance_name} {title}" + (f" ({i}/{len(pieces)})" if len(pieces) > 1 else ""),
+            content=piece,
+            embed_text=f"[{ordinance_name}] {title}\n{piece}"[:MAX_EMBED_CHARS],
+        )
+        for i, piece in enumerate(pieces, 1)
+    ]
 
 
 def is_local_ordinance(law_name: str, org_name: str) -> bool:

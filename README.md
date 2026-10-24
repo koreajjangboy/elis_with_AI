@@ -9,10 +9,10 @@
 
 ## 진행 단계
 - [x] 0. 저장소 및 기본 골격
-- [ ] 1. 범위·사용 시나리오 정의
-- [ ] 2. 데이터 확보 (국가법령정보센터 Open API 검증)
-- [ ] 3. 데이터 모델·청킹 설계
-- [ ] 4. 검색 파이프라인 구현
+- [x] 1. 범위·사용 시나리오 정의
+- [x] 2. 데이터 확보 (국가법령정보센터 Open API 검증)
+- [x] 3. 데이터 모델·청킹 설계
+- [x] 4. 검색 파이프라인 구현 (하이브리드 검색 + 근거 강제 RAG API + Streamlit)
 - [ ] 5. 평가셋 구축 및 성능 측정
 
 ## 디렉터리 구조
@@ -59,4 +59,62 @@ psql "$DATABASE_URL" -f db/schema.sql
 # 3. DB 적재 + Upstage 임베딩  (중단 후 재실행하면 이어서 처리)
 .venv/Scripts/python -m src.load_to_db
 .venv/Scripts/python -m src.load_to_db --embed-only   # 임베딩만 재시도
+
+# 4. 별표·서식: 첨부파일 수집 → 텍스트 추출·적재 → 임베딩
+.venv/Scripts/python -m src.collect_attachments
+.venv/Scripts/python -m src.load_attachments            # --ocr none|needs|images
+.venv/Scripts/python -m src.load_to_db --embed-only
+
+# 5. 적재·임베딩 상태 검증 (문제 있으면 종료 코드 1)
+.venv/Scripts/python -m src.check_status
+
+# 6. 검색·평가
+.venv/Scripts/python -m src.search "청년 창업 지원"
+.venv/Scripts/python -m src.evaluate --compare
 ```
+
+스키마 변경은 `db/migrations/`의 SQL을 순서대로 적용한다: `python -m src.migrate db/migrations/00N_….sql`
+별표·서식 설계: [docs/attachment_design.md](docs/attachment_design.md)
+
+### 적재 상태 검증
+- `python -m src.check_status`: 조례·조문·청크·별표 건수, 임베딩 완료율, 정합성 점검(임베딩 누락·차원 불일치·청크 없는 조례·빈 토큰 등), 최근 적재 이력.
+- Supabase SQL Editor에서는 [`db/verify.sql`](db/verify.sql)의 쿼리를 하나씩 실행한다 (5번 정합성 점검은 모두 0이어야 정상).
+
+## 질의응답 서비스 (FastAPI + Streamlit)
+
+```
+Streamlit(app.py) ──HTTP──▶ FastAPI(src/api.py) ──▶ 하이브리드 검색(src/search.py) ──▶ Supabase(pgvector)
+                                                └─▶ 근거 강제 RAG(src/rag.py) ──▶ LLM(src/llm.py: Claude | Solar)
+```
+
+```bash
+# 0. (최초 1회) 이미지형 별표 필드 마이그레이션
+.venv/Scripts/python -m src.migrate db/migrations/003_attachment_visual.sql
+
+# 1. API 서버  →  http://localhost:8000/docs
+.venv/Scripts/python -m uvicorn src.api:app --port 8000
+
+# 2. 웹 앱 (다른 터미널)  →  http://localhost:8501
+.venv/Scripts/streamlit run app.py
+
+# CLI로 바로 질문
+.venv/Scripts/python -m src.rag "공영주차장 주차요금 감면 대상은?"
+```
+
+LLM은 `.env`의 `ANTHROPIC_API_KEY`가 있으면 Claude(`claude-opus-5-5`), 없으면 임베딩과 같은 Upstage 키로 Solar(`solar-pro3`)를 쓴다.
+`LLM_PROVIDER=anthropic|upstage`로 고정할 수 있다.
+
+| API | 설명 |
+|---|---|
+| `GET /health` | DB 건수, 사용 중인 LLM |
+| `POST /search` `{"query", "limit"}` | 하이브리드 검색 결과 (LLM 미사용) |
+| `POST /ask` `{"question", "top_k"}` | 근거 인용 답변: `status`(answered/unverifiable), `answer`, `citations[{source_id, label, quote}]`, `sources[]`, `notes[]` |
+
+**근거 강제(확인 불가) 원칙** — 프롬프트 + 코드 검증 2중:
+1. 시스템 프롬프트: 제공된 조문·별표만 근거로 답하고, 근거가 없으면 `확인 불가` + 빈 인용. 답변 끝에 `근거: 조례명 제N조, [별표 N]`.
+2. JSON 스키마 강제 출력 → 서버가 모든 인용구를 근거 원문과 글자 단위로 대조. 불일치 인용이 있으면 1회 재생성,
+   그래도 유효한 인용이 없으면 `확인 불가`로 바꾼다. 답변에 근거 표기가 빠지면 `근거:` 줄을 자동으로 붙인다.
+3. 조문이 검색되면 관련 별표(`(제N조 관련)`, 본문의 `별표 N` 언급)를 근거 자료에 함께 넣는다.
+
+알려진 한계: 질문마다 새로 검색한다(대화 맥락을 검색에 쓰지 않음). 인용 검증은 '인용구가 원문에 있는가'까지만 보장하며,
+답변 문장 하나하나가 인용으로 뒷받침되는지는 검사하지 않는다 → `notes`에 제외된 인용이 표시되면 원문을 확인할 것.

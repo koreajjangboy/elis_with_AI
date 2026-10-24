@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src.law_api import ORG_CODES, LawApiClient, LawApiError
-from src.ordin_parser import parse_ordinance_detail, parse_search_result
+from src.ordin_parser import article_label, parse_ordinance_detail, parse_search_result
 
 RAW_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
 OUTPUT_PATH = RAW_DIR / "sample_ordinance.json"
@@ -129,7 +129,7 @@ def print_summary(ordinances: list[dict]) -> None:
         print(f"  인용 법령  : {', '.join(o['referenced_laws']) or '-'}")
 
         for art in o["articles"][:3]:
-            print(f"\n  제{art['article_no']}조({art['title']})")
+            print(f"\n  {article_label(art['article_no'])}({art['title']})")
             for p in art["paragraphs"]:
                 mark = f"{p['number']}항" if p["number"] else "본문"
                 print(f"    [{mark}] {p['text'][:80]}")
