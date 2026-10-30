@@ -58,3 +58,12 @@ def test_search_summary_handles_missing_query_type():
 def test_ordinance_of_handles_annex_labels():
     assert ordinance_of("수원시 주차장 조례 별표 1 공영주차장 주차요금표") == "수원시 주차장 조례"
     assert ordinance_of("수원시 주차장 조례 [별표 2] 감면 기준(제5조 관련)") == "수원시 주차장 조례"
+
+
+def test_request_cases_fail_without_request_list():
+    from src.evaluate_rag import classify
+
+    base = {"expected_status": "answered", "status": "answered", "cited_expected": True, "off_topic": [], "expect_requests": True}
+    assert classify({**base, "data_requests": []}) == "no_requests"
+    assert classify({**base, "data_requests": [{"item": "x"}]}) == "pass"
+    assert classify({**base, "expect_requests": False, "data_requests": []}) == "pass"

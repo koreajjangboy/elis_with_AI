@@ -114,7 +114,11 @@ class UpstageLLM:
                     _log_response(self.name, choice["message"]["content"] or "", choice.get("finish_reason"))
                     if choice.get("finish_reason") == "length":
                         raise LLMError("출력 길이 한도에 걸려 답변이 잘렸습니다.")
-                    return _parse_json(choice["message"]["content"])
+                    try:
+                        return _parse_json(choice["message"]["content"])
+                    except LLMError as e:  # 스키마 강제에도 가끔 깨진 JSON(닫히지 않은 문자열)을 낸다 → 다시 요청
+                        error = str(e)
+                        continue
                 error = f"HTTP {resp.status_code}: {resp.text[:300]}"
                 if resp.status_code not in (429, 500, 502, 503, 504):
                     break

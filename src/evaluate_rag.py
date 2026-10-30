@@ -8,18 +8,21 @@
 - over_refusal: answered 질의를 '확인 불가'로 처리
 - missing     : answered로 답했지만 정답 조문을 인용하지 않음
 - off_topic   : 정답 조례가 아닌 조례를 인용함 (타 조례 혼입)
+- no_requests : 자료요구·현안 질의(expect_requests)에 정답 조문을 인용했지만 요구 자료 목록이 없음
 통과는 두 가지로 센다: 실무 통과 = pass + partial, 엄격 통과 = pass.
 
 그 밖의 지표
 - 정답 조문 검색률·인용률, 타 조례 혼입률
 - 인용 검증: LLM 1차 응답 인용구의 원문 일치율, 재생성 발생률, 최종 제외된 인용 수
 - 방어선 작동: 조례명 점검(src.rag.apply_topic_guard), 2단계 근거 검증(src.rag.verify_answer)
+- 의정활동 모드: 질의 유형 판정 정확도(케이스의 mode), 요구 자료 목록 작성률, 요구 자료 근거 적중률(근거 조문이 정답 조례인 항목 비율)
 
 실행:
     python -m src.evaluate_rag                     # 전체
     python -m src.evaluate_rag --domain 환경·생활   # 특정 도메인만
     python -m src.evaluate_rag --limit 3            # 앞에서 3개만 (빠른 점검)
     python -m src.evaluate_rag --cases 다른평가셋.json  # 다른 평가셋 ({"cases": [...]} 또는 목록, 질문 필드는 question|query)
+    python -m src.evaluate_rag --cases tests/eval/rag_eval_request.json  # 자료요구·현안 추론 시나리오
 """
 
 from __future__ import annotations
@@ -33,29 +36,36 @@ import time
 from pathlib import Path
 
 from src.evaluate import REPORT_DIR, ROOT, article_of, norm
-from src.rag import TOPIC_NOTE, VERIFY_NOTE, VERIFY_SYSTEM_PROMPT, answer_question, check_citations
+from src.rag import ISSUE_SYSTEM_PROMPT, LINKED_ORDINANCE, TOPIC_NOTE, VERIFY_NOTE, VERIFY_SYSTEM_PROMPT, answer_question, check_citations
 
 RAG_EVAL_PATH = ROOT / "tests" / "eval" / "rag_eval.json"
 PASSING = {"pass", "partial"}
 OUTCOME_LABELS = {"pass": "통과", "partial": "고지형 부분 답변", "false_hard": "고지 없는 오답변", "over_refusal": "과잉 거절",
-                  "missing": "정답 조문 미인용", "off_topic": "타 조례 혼입", "error": "오류"}
+                  "missing": "정답 조문 미인용", "off_topic": "타 조례 혼입", "no_requests": "요구 자료 목록 없음", "error": "오류"}
+CALL_KINDS = {VERIFY_SYSTEM_PROMPT: "verify", ISSUE_SYSTEM_PROMPT: "expand"}
 
 
 class RecordingLLM:
-    """LLM 응답 원문(dict)을 호출 순서대로 기록한다. 답변 생성과 근거 검증 호출을 나눠 센다."""
+    """LLM 응답 원문(dict)을 호출 순서대로 기록한다. 답변 생성·근거 검증·현안 검색어 확장 호출을 나눠 센다."""
 
     def __init__(self, llm):
         self.llm = llm
         self.name = llm.name
-        self.calls: list[tuple[str, dict]] = []  # ('answer' | 'verify', 응답)
+        self.calls: list[tuple[str, dict]] = []  # ('answer' | 'verify' | 'expand', 응답)
 
     def complete_json(self, system: str, user: str, schema: dict) -> dict:
         raw = self.llm.complete_json(system, user, schema)
-        self.calls.append(("verify" if system == VERIFY_SYSTEM_PROMPT else "answer", raw))
+        self.calls.append((CALL_KINDS.get(system, "answer"), raw))
         return raw
 
     def answers(self) -> list[dict]:
         return [raw for kind, raw in self.calls if kind == "answer"]
+
+
+def short(question: str, n: int = 90) -> str:
+    """리포트용: 붙여넣은 기사처럼 긴 입력은 첫 줄 앞부분만."""
+    first = question.strip().splitlines()[0]
+    return first[:n] + ("…" if len(first) > n or "\n" in question.strip() else "")
 
 
 def ordinance_of(article: str) -> str:
@@ -84,7 +94,9 @@ def classify(rec: dict) -> str:
         return "over_refusal"
     if not rec["cited_expected"]:
         return "missing"
-    return "off_topic" if rec["off_topic"] else "pass"
+    if rec["off_topic"]:
+        return "off_topic"
+    return "no_requests" if rec.get("expect_requests") and not rec.get("data_requests") else "pass"
 
 
 def run_case(conn, embedder, llm, case: dict) -> dict:
@@ -119,10 +131,17 @@ def run_case(conn, embedder, llm, case: dict) -> dict:
         "unconfirmed": result.unconfirmed,
         "retrieved_expected": bool(expected & set(retrieved)) if expected else None,
         "cited_expected": bool(expected & set(cited_articles)) if expected else None,
-        "off_topic": sorted(set(cited_ordinances) - expected_ords) if expected and result.status == "answered" else [],
+        "off_topic": sorted(set(cited_ordinances) - expected_ords - {LINKED_ORDINANCE}) if expected and result.status == "answered" else [],
         "cited": cited_articles,
         "llm_calls": len(answers),
-        "verify_calls": len(recorder.calls) - len(answers),
+        "verify_calls": sum(kind == "verify" for kind, _ in recorder.calls),
+        "mode_detected": result.mode,
+        "mode_ok": result.mode == case["mode"] if case.get("mode") else None,
+        "search_queries": result.search_queries,
+        "news": {"title": result.news.title, "summary": result.news.summary, "keywords": result.news.keywords,
+                 "error": result.news.error} if result.news else None,
+        "data_requests": [{"item": r.item, "label": r.label, "purpose": r.purpose} for r in result.data_requests],
+        "requests_on_expected": sum(ordinance_of(r.label) in expected_ords for r in result.data_requests),
         "regenerated": len(answers) > 1,
         "first_quotes": first_total,
         "first_valid_quotes": first_valid,
@@ -148,6 +167,9 @@ def summarize(records: list[dict]) -> dict:
     count = lambda outcome: sum(r.get("outcome") == outcome for r in done)
     ratio = lambda a, b: a / b if b else None
     first_total = sum(r["first_quotes"] for r in done)
+    moded = [r for r in done if r.get("mode_ok") is not None]
+    req_answered = [r for r in done if r.get("expect_requests") and r["status"] == "answered"]
+    n_items = sum(len(r["data_requests"]) for r in req_answered)
     return {
         "n": len(records),
         "errors": len(records) - len(done),
@@ -169,6 +191,10 @@ def summarize(records: list[dict]) -> dict:
         "topic_guard": sum(r.get("topic_guard", False) for r in done),
         "verify_flagged": sum(r.get("verify_flagged", False) for r in done),
         "avg_seconds": ratio(sum(r["seconds"] for r in done), len(done)),
+        "mode_accuracy": ratio(sum(bool(r["mode_ok"]) for r in moded), len(moded)),
+        "request_list_rate": ratio(sum(bool(r["data_requests"]) for r in req_answered), len(req_answered)),
+        "request_grounded_rate": ratio(sum(r["requests_on_expected"] for r in req_answered), n_items),
+        "avg_requests": ratio(n_items, sum(bool(r["data_requests"]) for r in req_answered)),
     }
 
 
@@ -189,11 +215,19 @@ LABELS = [
     ("verify_flagged", "2단계 근거 검증 작동", "건"),
     ("avg_seconds", "평균 응답 시간", "s"),
 ]
+REQUEST_LABELS = [
+    ("mode_accuracy", "질의 유형 판정 정확도 (자료요구·현안)", "%"),
+    ("request_list_rate", "요구 자료 목록 작성률 (답변한 자료요구·현안 질의)", "%"),
+    ("request_grounded_rate", "요구 자료 근거 적중률 (근거가 정답 조례인 항목)", "%"),
+    ("avg_requests", "질의당 요구 자료 수", "n"),
+]
 
 
 def fmt(value, unit: str) -> str:
     if value is None:
         return "-"
+    if unit == "n":
+        return f"{value:.1f}건"
     return f"{value * 100:.0f}%" if unit == "%" else f"{value:.1f}s" if unit == "s" else f"{value}건"
 
 
@@ -201,7 +235,7 @@ def print_report(summary: dict, by_domain: dict[str, dict], records: list[dict],
     print(f"\n=== RAG 답변 품질 리포트 · {model} · {summary['n']}개 질의 ===")
     print(f"  실무 통과 {summary['pass']} (고지형 부분 답변 {summary['partial_answers']} 포함) · "
           f"엄격 통과 {summary['pass_strict']} · 오류 {summary['errors']}")
-    for key, label, unit in LABELS:
+    for key, label, unit in LABELS + [x for x in REQUEST_LABELS if summary[x[0]] is not None]:
         print(f"  {label:<34} {fmt(summary[key], unit)}")
 
     cols = [("status_accuracy", "상태정확", "%"), ("citation_hit", "인용적중", "%"), ("off_topic_rate", "혼입", "%"),
@@ -215,15 +249,27 @@ def print_report(summary: dict, by_domain: dict[str, dict], records: list[dict],
     if partial:
         print("\n[고지형 부분 답변 · 실무 통과]")
     for r in partial:
-        print(f"  △ [{r['domain']}] {r['question']}\n      확인되지 않은 사항: {', '.join(r['unconfirmed']) or '(답변 본문에 고지)'}"
+        print(f"  △ [{r['domain']}] {short(r['question'])}\n      확인되지 않은 사항: {', '.join(r['unconfirmed']) or '(답변 본문에 고지)'}"
               f" · 인용: {r['cited']}")
+
+    listed = [r for r in records if r.get("data_requests")]
+    if listed:
+        print("\n[요구 자료 목록 · 자료요구·현안 질의]")
+    for r in listed:
+        mode = {"request": "자료요구", "issue": "현안 추론"}.get(r["mode_detected"], r["mode_detected"])
+        print(f"  ▣ [{mode}] {short(r['question'])}" + (f"\n      함께 검색: {', '.join(r['search_queries'])}" if r["search_queries"] else ""))
+        if r.get("news"):
+            print(f"      기사: {r['news']['title']} · 현안 요지: {r['news']['summary']}")
+        print(f"      인용: {r['cited']} · 근거 적중 {r['requests_on_expected']}/{len(r['data_requests'])}")
+        for i, d in enumerate(r["data_requests"], 1):
+            print(f"      {i}. {d['item']}  ← {d['label']}")
 
     failed = [r for r in records if not r["ok"]]
     if failed:
         print("\n[실패 질의]")
     for r in failed:
         if "error" in r:
-            print(f"  ✗ [{r['domain']}] {r['question']}\n      오류: {r['error']}")
+            print(f"  ✗ [{r['domain']}] {short(r['question'])}\n      오류: {r['error']}")
             continue
         why = [OUTCOME_LABELS[r["outcome"]]]
         if r["outcome"] in ("over_refusal", "false_hard"):
@@ -232,7 +278,9 @@ def print_report(summary: dict, by_domain: dict[str, dict], records: list[dict],
             why.append(f"검색{'됨' if r['retrieved_expected'] else ' 안 됨'} · 인용: {r['cited']}")
         if r["off_topic"]:
             why.append(f"섞인 조례: {r['off_topic']}")
-        print(f"  ✗ [{r['domain']}] {r['question']}\n      - " + " · ".join(why))
+        if r.get("mode_ok") is False:
+            why.append(f"질의 유형 {r['mode_detected']} (기대 {r['mode']})")
+        print(f"  ✗ [{r['domain']}] {short(r['question'])}\n      - " + " · ".join(why))
         for n in r["notes"]:
             print(f"      ※ {n}")
 
@@ -266,7 +314,7 @@ def main() -> None:
             rec = run_case(conn, embedder, llm, case)
             records.append(rec)
             print(f"[{i:>2}/{len(cases)}] {marks.get(rec['outcome'], '✗')} {rec.get('status', 'error'):<12} "
-                  f"{case.get('id', '')} {case['question']}")
+                  f"{case.get('id', '')} {short(case['question'])}")
 
     summary = summarize(records)
     by_domain = {d: summarize([r for r in records if r["domain"] == d]) for d in sorted({r["domain"] for r in records})}

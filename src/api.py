@@ -8,6 +8,7 @@
     GET  /health   DB·LLM 상태
     POST /search   하이브리드 검색 결과 (LLM 없이)
     POST /ask      근거 조문·별표를 인용한 답변. 근거가 없으면 answer='확인 불가', citations=[]
+                   자료요구·언론 보도·뉴스 기사(URL 또는 본문) 질의면 요구할 자료 목록(data_requests)을 함께 준다
 """
 
 from __future__ import annotations
@@ -71,7 +72,8 @@ class SearchHitOut(BaseModel):
 
 
 class AskRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=1000, examples=["공영주차장 주차요금 감면 대상은?"])
+    question: str = Field(min_length=1, max_length=20000, examples=["공영주차장 주차요금 감면 대상은?"],
+                          description="질문, 뉴스 기사 URL(요청 문장과 함께 가능) 또는 붙여넣은 기사 본문")
     top_k: int = Field(DEFAULT_TOP_K, ge=1, le=15, description="검색해 근거 자료로 넘길 조문·별표 수 (관련 별표는 별도로 최대 3건 추가)")
     org_code: str = SBORG
 
@@ -80,6 +82,24 @@ class CitationOut(BaseModel):
     source_id: str
     label: str
     quote: str
+    relabeled_from: str | None = Field(None, description="모델이 단 자료 번호가 틀려 바로잡은 경우 원래 번호")
+
+
+class NewsOut(BaseModel):
+    title: str
+    url: str | None
+    source: str = Field(description="'url'(기사 URL에서 추출) | 'text'(붙여넣은 본문)")
+    summary: str = Field(description="현안 요지 (LLM 분석)")
+    keywords: list[str]
+    body_chars: int
+    error: str | None = Field(description="URL을 읽지 못한 사유")
+
+
+class DataRequestOut(BaseModel):
+    item: str = Field(description="행정에 요구할 자료명")
+    source_id: str
+    label: str = Field(description="근거 조문")
+    purpose: str = Field(description="그 조문의 어떤 규정의 이행을 확인하는지")
 
 
 class SourceOut(BaseModel):
@@ -112,6 +132,11 @@ class AskResponse(BaseModel):
     notes: list[str]
     unconfirmed: list[str] = Field(default_factory=list,
                                    description="질문 중 근거 자료로 확인되지 않은 사항 (비어 있지 않으면 부분 답변)")
+    mode: str = Field("qa", description="'qa' | 'request'(자료요구) | 'issue'(언론 보도·현안 추론)")
+    data_requests: list[DataRequestOut] = Field(default_factory=list,
+                                                description="자료요구·현안 모드에서 행정에 요구할 자료 목록 (항목마다 근거 조문)")
+    search_queries: list[str] = Field(default_factory=list, description="현안 모드에서 함께 검색한 조례 용어 검색어")
+    news: NewsOut | None = Field(None, description="뉴스 기사 입력이면 기사 제목·현안 요지·핵심어")
 
 
 # ---------------------------------------------------------------- 엔드포인트

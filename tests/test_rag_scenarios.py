@@ -5,6 +5,7 @@
 
 - 검색 테스트: 정답 조문이 RAG 근거 자료(top_k)에 들어오는지 (임베딩 API만 사용)
 - 답변 테스트: answered 시나리오는 정답 조문을 인용했는지, unverifiable 시나리오는 '확인 불가' + 빈 인용인지
+- 모드 테스트: 자료요구·언론 보도 질의가 해당 모드로 답하고, 요구 자료 목록의 근거가 인용된 정답 조례 조문인지
 """
 
 from __future__ import annotations
@@ -105,3 +106,27 @@ def test_scenario_answer_status_and_citation(ctx, sc: Scenario):
     else:
         assert cited & _article_set(sc.expected), f"정답 조문 {sc.expected}을 인용하지 않음: {sorted(cited)}"
         assert "근거:" in result.answer
+
+
+# 의정활동 모드: 자료요구 / 언론 보도·현안 추론 → 근거 조문 인용 + 요구 자료 목록
+MODE_SCENARIOS = [
+    ("자료요구_마을만들기", "마을만들기 사업 관련 자료요구 해줘", "request", "수원시 마을만들기 조례"),
+    ("현안_공영주차장", "수원시 공영주차장 관리 부실 지적 잇따라", "issue", "수원시 주차장 조례"),
+]
+
+
+@pytest.mark.parametrize("sid,question,mode,ordinance", MODE_SCENARIOS, ids=[m[0] for m in MODE_SCENARIOS])
+def test_mode_scenario_builds_grounded_request_list(ctx, sid, question, mode, ordinance):
+    from src.llm import llm_from_env
+    from src.rag import answer_question
+
+    conn, embedder = ctx
+    result = answer_question(conn, embedder, llm_from_env(), question)
+    print(f"\n[{sid}] mode={result.mode} status={result.status} 검색어={result.search_queries}\n{result.answer}")
+    for i, r in enumerate(result.data_requests, 1):
+        print(f"  {i}. {r.item} ← {r.label}")
+
+    assert result.mode == mode and result.status == "answered"
+    assert result.data_requests, "요구 자료 목록이 비어 있음"
+    cited = {c.source_id for c in result.citations}
+    assert all(r.source_id in cited and r.label.startswith(ordinance) for r in result.data_requests)

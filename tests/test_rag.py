@@ -53,13 +53,14 @@ def test_fabricated_quote_turns_into_unverifiable():
     assert any("일치하지 않는 인용 1건" in n for n in result.notes)
 
 
-def test_quote_from_wrong_source_or_unknown_id_is_dropped():
+def test_quote_from_wrong_source_is_relabeled_only_when_unambiguous():
     raw = {"status": "answered", "answer": "경형자동차는 50퍼센트 감면합니다. [별표 2]",
-           "citations": [{"source_id": "S1", "quote": "경형자동차 | 50퍼센트"},  # S2의 문장을 S1으로 인용
-                         {"source_id": "S9", "quote": "경형자동차"},
+           "citations": [{"source_id": "S1", "quote": "경형자동차 | 50퍼센트"},  # S2의 문장을 S1으로 인용 → S2로 바로잡음
+                         {"source_id": "S9", "quote": "자동차"},  # 없는 번호 + S1·S2 둘 다에 있음 → 어느 자료인지 몰라 제외
+                         {"source_id": "S3", "quote": "원문에 없는 문장"},
                          {"source_id": "S2", "quote": "경형자동차 | 50퍼센트"}]}
     result = validate_answer(raw, _sources(), "test")
-    assert [c.source_id for c in result.citations] == ["S2"]
+    assert [(c.source_id, c.relabeled_from) for c in result.citations] == [("S2", "S1"), ("S2", None)]
 
 
 def test_placeholder_attachment_cannot_be_evidence():
@@ -309,11 +310,16 @@ def test_prompt_allows_partial_answers_and_limits_unverifiable():
 
 
 
-def test_prompt_treats_data_requests_as_operating_rules():
-    from src.rag import SYSTEM_PROMPT
+def test_prompt_has_request_and_issue_modes():
+    from src.rag import MODE_ISSUE, MODE_REQUEST, SYSTEM_PROMPT
 
-    assert "자료요구" in SYSTEM_PROMPT and "위탁 관리, 요금 징수, 운영 기준" in SYSTEM_PROMPT
-    assert "조례로는 확인할 수 없음" in SYSTEM_PROMPT  # 실적·수입 같은 사실 정보는 여전히 조례로 확인 불가
+    assert "[자료요구 모드]" in SYSTEM_PROMPT and "[현안 추론 모드]" in SYSTEM_PROMPT and "data_requests" in SYSTEM_PROMPT
+    assert "자료를 행정에 요구할 수 있습니다" in SYSTEM_PROMPT and "금지" in SYSTEM_PROMPT  # 과잉 거절 금지
+    assert "사실로 단정하지 않는다" in SYSTEM_PROMPT  # 보도 사실관계는 단정하지 않음
+    request = build_user_prompt("공영주차장 운영 자료요구 해줘", _sources(), MODE_REQUEST)
+    assert "[자료요구 모드]" in request and request.index("[자료요구 모드]") > request.index("[답변 요청]")
+    assert "본 현안과 관련하여" in build_user_prompt("공영주차장 관리 부실 지적", _sources(), MODE_ISSUE)
+    assert "data_requests는 빈 배열" in build_user_prompt("감면 대상은?", _sources())
 
 
 class _FakeLLM:
@@ -387,3 +393,190 @@ def test_unconfirmed_items_mark_partial_answers():
                                  "unconfirmed": []}, _sources(), "test")
     assert disclosed.partial  # unconfirmed가 비어도 본문에서 스스로 밝혔으면 부분 답변
 
+
+# ---- 의정활동 모드 (자료요구 · 현안 추론)
+
+def test_detect_mode_separates_requests_issues_and_plain_questions():
+    from src.rag import MODE_ISSUE, MODE_QA, MODE_REQUEST, detect_mode
+
+    for q in ["마을만들기 사업 관련 자료요구 해줘", "청년 창업 지원 사업 현황 자료를 뽑아줘",
+              "공공주차장 운영과 관련한 자료요구 해주세요", "소규모 공동주택 지원 사업 자료 요청 목록",
+              "대행업체 평가 위원회의 운영 실태를 점검하기 위해 어떤 조문 근거로 어떤 자료를 요구할 수 있나요?"]:
+        assert detect_mode(q) == MODE_REQUEST, q
+    for q in ["수원시 공영주차장 관리 부실 지적 잇따라", "청년 창업 지원금 집행 논란",
+              "[단독] 지하차도 침수 대응 늑장", "소규모 공동주택 지원금 특혜 의혹 보도"]:
+        assert detect_mode(q) == MODE_ISSUE, q
+    for q in ["공영주차장 주차요금 감면 대상은?", "생활폐기물 수집·운반 대행업체 평가 시 어떤 자료를 요구할 수 있나요?",
+              "2026년도 공영주차장 실제 연간 총수입 금액은 얼마인가요?"]:
+        assert detect_mode(q) == MODE_QA, q
+
+
+def test_data_requests_keep_only_items_grounded_on_valid_citations():
+    raw = {"status": "answered", "answer": "제5조에 따른 감면 실적 자료를 요구할 수 있습니다.\n근거: 수원시 주차장 조례 제5조",
+           "citations": [{"source_id": "S1", "quote": "장애인 자동차: 100분의 50"}], "unconfirmed": [],
+           "data_requests": [
+               {"item": "최근 3년간 장애인 자동차 주차요금 감면 실적", "source_id": "S1", "purpose": "제5조 감면 이행 확인"},
+               {"item": "최근 3년간 장애인 자동차 주차요금 감면 실적", "source_id": "[S1]", "purpose": "중복"},
+               {"item": "경형자동차 감면 내역", "source_id": "S2", "purpose": "인용되지 않은 자료"},
+               {"item": " ", "source_id": "S1", "purpose": ""}]}
+    result = validate_answer(raw, _sources(), "test")
+    assert [(r.item, r.source_id, r.label) for r in result.data_requests] == [
+        ("최근 3년간 장애인 자동차 주차요금 감면 실적", "S1", "수원시 주차장 조례 제5조")]
+    assert any("요구 자료 1건" in n for n in result.notes)
+    assert validate_answer({**raw, "status": "unverifiable"}, _sources(), "test").data_requests == []
+
+
+def test_apply_verification_drops_requests_of_rejected_citations():
+    from src.rag import Answer, Citation, DataRequest, apply_verification
+
+    src = _sources()
+    answer = Answer("answered", "…", [Citation("S1", src[0].label, "장애인 자동차: 100분의 50"),
+                                       Citation("S2", src[1].label, "경형자동차 | 50퍼센트")], src, "test",
+                    data_requests=[DataRequest("감면 실적", "S1", src[0].label, ""), DataRequest("경형 감면 내역", "S2", src[1].label, "")])
+    kept = apply_verification(answer, {"S2": "질문 대상과 다른 조문"})
+    assert [r.item for r in kept.data_requests] == ["감면 실적"]
+
+
+def test_merge_hits_interleaves_queries_without_duplicates():
+    from src.rag import merge_hits
+    from src.search import SearchHit
+
+    def hit(cid):
+        return SearchHit(chunk_id=cid, article_id=cid, attachment_id=None, ordinance_id=1, citation="", content="",
+                         ordinance_name="", article_title="", enforcement_date=None, vec_rank=None, kw_rank=None)
+
+    merged = merge_hits([[hit(1), hit(2), hit(3)], [hit(9), hit(1)], [hit(7)]], limit=5)
+    assert [h.chunk_id for h in merged] == [1, 2, 9, 7, 3]  # 원 질문 상위 절반(2건)을 먼저, 나머지는 번갈아
+
+
+def test_analyze_issue_uses_llm_and_tolerates_failure():
+    from src.rag import ISSUE_SYSTEM_PROMPT, analyze_issue
+
+    q = "수원시 공영주차장 관리 부실 지적"
+    llm = _FakeLLM({"issue": "공영주차장 위탁 관리 부실", "keywords": ["공영주차장", "위탁", "공영주차장"],
+                    "queries": ["공영주차장 위탁관리", q, "공영주차장 위탁관리", "주차장 관리상황 보고", "a", "b"]})
+    assert analyze_issue(llm, q) == ("공영주차장 위탁 관리 부실", ["공영주차장", "위탁"], ["공영주차장 위탁관리", "주차장 관리상황 보고", "a"])
+    assert llm.calls[0][0] == ISSUE_SYSTEM_PROMPT and q in llm.calls[0][1]
+    assert analyze_issue(_FakeLLM(error=RuntimeError("timeout")), q) == ("", [], [])
+
+
+def test_news_question_carries_article_and_user_request():
+    from src.news_parser import NewsArticle
+    from src.rag import NEWS_DEFAULT_REQUEST, NEWS_PROMPT_CHARS, SYSTEM_PROMPT, news_question
+
+    url = "https://www.segye.com/newsView/20261022507676"
+    news = NewsArticle(title="장애인 자립주택부터 청년 이자 지원까지", body="가" * (NEWS_PROMPT_CHARS + 10), url=url, source="url")
+    asked = news_question(news, f"{url} 장애인 주거 관련 자료요구 해줘")
+    assert asked.startswith(f"[뉴스 기사] {url}\n제목: 장애인 자립주택부터")
+    assert "(이하 생략)" in asked and asked.endswith("사용자 요청: 장애인 주거 관련 자료요구 해줘")
+    pasted = NewsArticle(title="제목", body="본문", source="text")
+    assert news_question(pasted, "제목\n본문").endswith(NEWS_DEFAULT_REQUEST)
+    assert "[뉴스/현안 기반 유추 분석 지침]" in SYSTEM_PROMPT and "협약서" in SYSTEM_PROMPT
+
+
+def test_verify_prompt_treats_request_guidance_as_not_a_claim():
+    from src.rag import VERIFY_SYSTEM_PROMPT
+
+    assert "자료를 행정에 요구할 수 있다" in VERIFY_SYSTEM_PROMPT and "현안" in VERIFY_SYSTEM_PROMPT
+
+
+def test_verification_strips_sentences_about_dropped_ordinances():
+    from src.rag import Answer, Citation, apply_verification
+
+    youth = Source(id="S1", kind="article", label="수원시 청년 창업 지원 조례 제5조", ref="제5조", ordinance_name="수원시 청년 창업 지원 조례",
+                   title="사업지원", content="시장은 청년 창업을 위하여 다음 각 호의 사업을 지원할 수 있다.")
+    other = Source(id="S2", kind="article", label="수원시 효사랑 지원금 지급 조례 제8조", ref="제8조", ordinance_name="수원시 효사랑 지원금 지급 조례",
+                   title="환수조치", content="시장은 지원금의 전부 또는 일부를 환수할 수 있다.")
+    body = ("법적 근거는 수원시 청년 창업 지원 조례 제5조입니다. 지원금의 환수는 수원시 효사랑 지원금 지급 조례 제8조에 규정되어 있습니다. "
+            "보도된 사실관계는 조례로 확인할 수 없습니다.\n근거: 수원시 청년 창업 지원 조례 제5조, 수원시 효사랑 지원금 지급 조례 제8조")
+    answer = Answer("answered", body, [Citation("S1", youth.label, "청년 창업을 위하여"), Citation("S2", other.label, "환수할 수 있다")],
+                    [youth, other], "test")
+    result = apply_verification(answer, {"S2": "질문 대상과 다른 조문: 다른 지원금의 환수 조항"})
+    assert "효사랑" not in result.answer
+    assert "청년 창업 지원 조례 제5조입니다." in result.answer and "확인할 수 없습니다." in result.answer
+    assert result.answer.endswith("근거: 수원시 청년 창업 지원 조례 제5조")
+    assert any("문장도 지웠습니다" in n for n in result.notes)
+
+
+def test_issue_expansion_prompt_asks_for_article_title_terms():
+    from src.rag import ISSUE_SYSTEM_PROMPT
+
+    assert "조 제목" in ISSUE_SYSTEM_PROMPT and "도시공원 금지행위" in ISSUE_SYSTEM_PROMPT
+    assert "보도 표현" in ISSUE_SYSTEM_PROMPT  # 불법·단속·논란 같은 보도 어휘는 검색어에서 뺀다
+
+
+def test_wrong_source_id_is_relabeled_when_quote_exists_in_exactly_one_other_source():
+    raw = {"status": "answered", "answer": "감면율은 50퍼센트입니다.\n근거: 수원시 주차장 조례 [별표 2]",
+           "citations": [{"source_id": "S1", "quote": "경형자동차 | 50퍼센트"},  # 실제로는 S2([별표 2])의 문장
+                         {"source_id": "S1", "quote": "원문에 없는 문장"}],
+           "unconfirmed": [], "data_requests": [{"item": "경형자동차 감면 실적", "source_id": "S1", "purpose": ""}]}
+    result = validate_answer(raw, _sources(), "test")
+    assert [(c.source_id, c.relabeled_from) for c in result.citations] == [("S2", "S1")]
+    assert [r.source_id for r in result.data_requests] == ["S2"]  # 같은 틀린 번호를 단 요구 자료도 따라간다
+    assert any("자료 번호가 틀린 인용 1건" in n for n in result.notes)
+    assert any("일치하지 않는 인용 1건" in n for n in result.notes)
+
+
+def test_quote_skipping_enumerated_items_matches_in_order_only():
+    plan = Source(id="S1", kind="article", label="수원시 주거복지 조례 제5조", ref="제5조", ordinance_name="수원시 주거복지 조례",
+                  title="주거복지종합계획 수립·시행",
+                  content=("제5조(주거복지종합계획 수립·시행)\n① 시장은 5년 단위로 주거복지종합계획을 수립·시행하여야 한다.\n"
+                           "③ 주거복지종합계획에는 다음 각 호의 사항이 포함되어야 한다.\n1. 주거복지 정책의 기본 방향\n"
+                           "2. 주거실태조사에 관한 사항\n5. 주거지원이 필요한 계층에 대한 임대주택 우선공급 및 주거비 지원 등에 관한 사항"))
+    skip = "③ 주거복지종합계획에는 다음 각 호의 사항이 포함되어야 한다. 5. 주거지원이 필요한 계층에 대한 임대주택 우선공급 및 주거비 지원 등에 관한 사항"
+    assert quote_in_source(skip, plan)
+    assert quote_in_source("① 시장은 5년 단위로 주거복지종합계획을 수립·시행하여야 한다. ③ 주거복지종합계획에는 다음 각 호의 사항이 포함되어야 한다.", plan)
+    assert not quote_in_source("5. 주거지원이 필요한 계층에 대한 임대주택 우선공급 1. 주거복지 정책의 기본 방향", plan)  # 순서가 뒤바뀜
+    assert not quote_in_source("③ 주거복지종합계획에는 다음 각 호의 사항이 포함되어야 한다. 5. 청년 보증금 이자 지원", plan)  # 없는 호
+
+
+def test_request_mode_adds_operating_articles_of_core_ordinance():
+    from src.rag import pick_sibling_articles
+
+    # 주차장 조례 일부 (조문 순서)
+    articles = [(1, "목적"), (2, "주차장수급실태조사"), (3, "주차요금 및 가산금"), (4, "공영주차장의 위탁관리"),
+                (5, "관리ㆍ감독ㆍ관리상황의 보고 등"), (6, "계약의 해지 등"), (7, "공무수행사인의 행위제한 등"),
+                (8, "공영주차장의 주차요금 징수방법"), (9, "부설주차장의 설치기준")]
+    picked = [aid for aid, _ in pick_sibling_articles(articles, core_id=4, exclude=set(), limit=3)]
+    assert picked == [5, 6, 2]  # 가까운 운영 조문 먼저, 같은 거리면 뒤쪽 — 목적·행위제한·설치기준은 제외
+    assert [aid for aid, _ in pick_sibling_articles(articles, 4, exclude={5, 6}, limit=2)] == [2, 8]
+    assert pick_sibling_articles(articles, core_id=99, exclude=set()) == []
+
+
+def test_topic_guard_rejects_ordinance_of_another_district():
+    from src.rag import off_topic_ordinances
+
+    q = "탑동지구 공공개발 사업 부지의 평당 감정평가액은 얼마인가요?"
+    w = {"탑동": 3.0, "공공": 1.0, "개발": 1.0, "부지": 1.0}
+    other = "수원시 신동지구 도시개발사업 시행 조례"
+    assert off_topic_ordinances(w, [other], [other], q) == [other]
+    assert off_topic_ordinances(w, [other], [other], "신동지구 토지 평가 방법은?") == []
+    assert off_topic_ordinances(w, ["수원시 공유재산 관리 조례"], [other], q) == []  # 지구명이 없는 조례는 이 규칙과 무관
+
+
+def test_request_checklist_goes_into_answer_body_before_basis_line():
+    from src.rag import CHECKLIST_TITLE, DataRequest, with_request_checklist
+
+    reqs = [DataRequest("최근 3년간 예술인 창작 공간 지원 실적", "S1", "수원시 예술인 복지증진에 관한 조례 제7조", ""),
+            DataRequest("최근 3년간 예술인 지원 예산 편성 및 집행 내역(불용액 포함)", "S2", "수원시 예술인 복지증진에 관한 조례 제8조", "")]
+    text = "제5조에 따른 사업의 추진 실적 등의 자료를 행정에 요구할 수 있습니다.\n\n근거: 수원시 예술인 복지증진에 관한 조례 제5조"
+    out = with_request_checklist(text, reqs)
+    assert out.endswith("근거: 수원시 예술인 복지증진에 관한 조례 제5조")
+    assert f"{CHECKLIST_TITLE}\n1. 최근 3년간 예술인 창작 공간 지원 실적 (근거: 수원시 예술인 복지증진에 관한 조례 제7조)\n2. " in out
+    assert with_request_checklist(out, reqs) == out and with_request_checklist(text, []) == text
+
+
+def test_request_mode_for_first_person_requests_and_program_law_questions():
+    from src.rag import MODE_QA, MODE_REQUEST, detect_mode
+
+    assert detect_mode("지역예술인 지원 사업과 관련한 자료를 요구하고 싶습니다") == MODE_REQUEST
+    assert detect_mode("지역예술인 지원 사업 관련 조례를 알려줘") == MODE_REQUEST
+    assert detect_mode("2026년도 청년 창업 지원 사업의 실제 예산 집행 총액은 얼마인가요?") == MODE_QA
+
+
+def test_outsourcing_ordinance_is_not_off_topic():
+    from src.rag import LINKED_ORDINANCE, off_topic_ordinances
+
+    w = {"예술인": 3.0, "지원": 0.5}
+    retrieved = ["수원시 예술인 복지증진에 관한 조례", LINKED_ORDINANCE]
+    assert off_topic_ordinances(w, [LINKED_ORDINANCE, "수원시 예술인 복지증진에 관한 조례"], retrieved) == []

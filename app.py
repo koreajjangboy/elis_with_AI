@@ -16,15 +16,50 @@ import re
 import requests
 import streamlit as st
 
+from src.news_parser import extract_url, looks_like_article
 from src.rag import split_quote
 
 API_URL = os.getenv("ELIS_API_URL", "http://localhost:8000").rstrip("/")
 UNVERIFIABLE = "확인 불가"
 EXAMPLES = [
     "공영주차장 주차요금 감면 대상은?",
-    "청년 창업 지원 대상과 지원 내용은?",
-    "재난관리기금은 어디에 쓸 수 있나요?",
+    "마을만들기 사업 관련 자료요구 해줘",
+    "수원시 공영주차장 관리 부실 지적 잇따라",
 ]
+MODE_LABELS = {"request": "📋 자료요구", "issue": "📰 현안 추론"}
+QUESTION_PREVIEW_CHARS = 300
+
+
+def is_news_input(text: str) -> bool:
+    return bool(extract_url(text)) or looks_like_article(text)
+
+
+def render_question(text: str) -> None:
+    """붙여넣은 기사처럼 긴 입력은 앞부분만 보이고 나머지는 펼쳐보기로."""
+    if len(text) <= QUESTION_PREVIEW_CHARS:
+        st.markdown(text)
+        return
+    st.markdown(text[:QUESTION_PREVIEW_CHARS] + "…")
+    with st.expander(f"입력 전문 ({len(text):,}자)"):
+        st.text(text)
+
+
+def render_news(news: dict | None) -> None:
+    """뉴스 입력: 기사 제목·출처, 현안 요지, 핵심어."""
+    if not news:
+        return
+    with st.container(border=True):
+        title = news.get("title") or "(제목 없음)"
+        st.markdown(f"**📰 뉴스 현안 분석** — [{title}]({news['url']})" if news.get("url") else f"**📰 뉴스 현안 분석** — {title}")
+        origin = "기사 URL에서 추출" if news["source"] == "url" else "붙여넣은 기사 본문"
+        st.caption(f"{origin} · 본문 {news['body_chars']:,}자")
+        if news.get("error"):
+            st.warning(f"기사 URL을 읽지 못했습니다: {news['error']}"
+                       + ("" if news["body_chars"] else "\n\n기사 본문을 복사해 질문 창에 붙여넣으면 분석할 수 있습니다."))
+        if news.get("summary"):
+            st.markdown(f"**현안 요지** {news['summary']}")
+        if news.get("keywords"):
+            st.markdown("**핵심어** " + " ".join(f"`{k}`" for k in news["keywords"]))
 
 st.set_page_config(page_title="수원시 자치법규 AI", page_icon="⚖️", layout="wide")
 
@@ -89,14 +124,32 @@ def render_source(src: dict, quotes: list[str], expanded: bool) -> None:
             st.link_button("원문 파일 내려받기", src["source_url"])
 
 
+def render_requests(requests_: list[dict]) -> None:
+    """요구 자료 목록은 답변 본문(체크리스트)에 들어 있다 → 근거·확인 목적 표와 자료요구서용 복사 목록만 접어서 보인다."""
+    if not requests_:
+        return
+    with st.expander(f"요구 자료 상세 — 근거 조문·확인 목적 ({len(requests_)}건)"):
+        st.dataframe(
+            [{"요구 자료": r["item"], "근거 조문": r["label"], "확인 목적": r["purpose"]} for r in requests_],
+            hide_index=True, use_container_width=True,
+        )
+    with st.expander("자료요구서용 목록 (복사)"):
+        st.code("\n".join(f"{i}. {r['item']} (근거: {r['label']})" for i, r in enumerate(requests_, 1)), language=None)
+
+
 def render_answer(result: dict) -> None:
+    render_news(result.get("news"))
     if result["status"] == "unverifiable":
         st.warning(f"**{UNVERIFIABLE}** — 검색된 조문·별표에서 질문에 대한 근거를 찾지 못했습니다. "
                    "아래 검색 결과를 직접 확인하거나 질문을 구체적으로 바꿔 보세요.")
     else:
+        if result.get("mode") in MODE_LABELS:
+            st.caption(MODE_LABELS[result["mode"]] + (f" · 함께 검색: {', '.join(result['search_queries'])}"
+                                                      if result.get("search_queries") else ""))
         st.markdown(result["answer"])
         if result.get("unconfirmed"):
             st.info("**조례로 확인되지 않은 사항** (부분 답변)\n\n" + "\n".join(f"- {u}" for u in result["unconfirmed"]))
+        render_requests(result.get("data_requests") or [])
 
     for note in result.get("notes", []):
         st.caption(f"ℹ️ {note}")
@@ -141,6 +194,7 @@ with st.sidebar:
         "- 검색된 조문·별표 원문만 근거로 답합니다.\n"
         f"- 근거가 없으면 **‘{UNVERIFIABLE}’**로 답하고 인용을 비웁니다.\n"
         "- 인용구는 서버에서 원문과 글자 단위로 대조해 검증합니다.\n"
+        "- ‘OO 사업 자료요구 해줘’나 언론 보도 제목, **뉴스 기사 URL·본문**을 넣으면 근거 조문과 요구할 자료 목록을 만듭니다.\n"
         "- 질문마다 새로 검색합니다. 후속 질문에도 조례명·주제를 함께 적어 주세요."
     )
     if st.button("대화 지우기"):
@@ -163,19 +217,21 @@ if not st.session_state.messages:
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         if msg["role"] == "user":
-            st.markdown(msg["content"])
+            render_question(msg["content"])
         elif "result" in msg:
             render_answer(msg["result"])
         else:
             st.error(msg["content"])
 
-question = st.chat_input("질문을 입력하세요 (예: 공영주차장 주차요금 감면 대상은?)") or st.session_state.pop("pending", None)
+question = st.chat_input("질문, 뉴스 기사 URL 또는 기사 본문을 입력하세요") or st.session_state.pop("pending", None)
 if question:
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
-        st.markdown(question)
+        render_question(question)
     with st.chat_message("assistant"):
-        with st.spinner("조문·별표를 검색하고 근거를 확인하는 중…"):
+        spinner = ("📰 뉴스 현안 분석 중… (기사 읽기 → 현안·핵심어 추출 → 관련 조례 검색 → 자료요구안 작성)"
+                   if is_news_input(question) else "조문·별표를 검색하고 근거를 확인하는 중…")
+        with st.spinner(spinner):
             try:
                 result = api_post("/ask", {"question": question, "top_k": top_k})
             except (requests.RequestException, RuntimeError) as e:
